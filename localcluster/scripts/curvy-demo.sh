@@ -16,6 +16,10 @@
 #     question asked of them: which addresses did the Entry pay, which paid the Exit, and do the
 #     two sets meet?
 #
+# `--ledger` adds the bill: every transaction on the chain priced from its receipt, grouped by
+# who paid the gas and what the call did (a Safe module call is named by what the Safe then
+# did), with the average per action and what one PIX deposit costs the pool.
+#
 # The last section is the one to show. With the test pool (`PIX_POOL=test`) the sets meet on
 # every deposit address, and the verdict reads LINKED; with Curvy they do not, and it reads
 # UNLINKED. Nothing in the verdict knows which pool is running — it is computed from the
@@ -26,13 +30,13 @@
 #   ./localcluster/scripts/pix-demo.sh                                  # pane 1
 #   ./localcluster/scripts/curvy-demo.sh                                # pane 2, refreshes until Ctrl-C
 #   watch -n 2 -c ./localcluster/scripts/curvy-demo.sh --dashboard      # or under watch(1)
-#   ./localcluster/scripts/curvy-demo.sh --ledger                       # every transfer + the verdict, once
+#   ./localcluster/scripts/curvy-demo.sh --ledger                       # every transfer, the verdict, the gas bill, once
 #   ./localcluster/scripts/curvy-demo.sh --rpc                          # every Curvy tx and note, once
 #
 # Sources: Blokli's GraphQL API on :8080 (the deployment's contract addresses, vault fees,
 # aggregator state, the indexed notes and nullifiers); `cast` inside the chain container (the raw
-# `Transfer` log, receipts and calldata straight out of anvil — the one source that owes nothing
-# to HOPR or Curvy code);
+# `Transfer` log, every block's transactions and receipts straight out of anvil — the one source
+# that owes nothing to HOPR or Curvy code);
 # the nodes' logs (found through each hoprd's stdout while it runs, `/tmp/pix-soak-logs` after);
 # and the REST API for node addresses.
 #
@@ -169,6 +173,7 @@ node_excerpt() {
 }
 
 node_safe() { grep -o 'safe_address\\":\\"0x[0-9a-fA-F]*' <<<"$2" | head -1 | grep -o '0x.*'; }
+node_module() { grep -o 'module_address\\":\\"0x[0-9a-fA-F]*' <<<"$2" | head -1 | grep -o '0x.*'; }
 
 node_address() {
   cache "addr_$1" sh -c "curl -s --max-time 3 http://127.0.0.1:$((API_PORT_BASE + $1))/api/v4/account/addresses | jq -r '.native // empty'"
@@ -393,6 +398,7 @@ gather() {
   for i in "${ALL_IDXS[@]}"; do
     EXCERPT[i]=$(node_excerpt "$i")
     SAFE[i]=$(lower "$(node_safe "$i" "${EXCERPT[i]}")")
+    MODULE[i]=$(lower "$(node_module "$i" "${EXCERPT[i]}")")
     ADDR[i]=$(lower "$(node_address "$i")")
   done
   POOL=$(grep -o 'pool="[a-z0-9-]*"' <<<"${EXCERPT[$ENTRY_IDX]}" | head -1 | cut -d'"' -f2)
@@ -432,12 +438,15 @@ gather() {
   [ -n "$PORTAL" ] && LABEL[$PORTAL]="Entry's shield portal"
   [ -n "${SAFE[$ENTRY_IDX]}" ] && LABEL[${SAFE[$ENTRY_IDX]}]="Entry Safe"
   [ -n "${SAFE[$EXIT_IDX]}" ] && LABEL[${SAFE[$EXIT_IDX]}]="Exit Safe"
+  [ -n "${MODULE[$ENTRY_IDX]}" ] && LABEL[${MODULE[$ENTRY_IDX]}]="Entry Safe module"
+  [ -n "${MODULE[$EXIT_IDX]}" ] && LABEL[${MODULE[$EXIT_IDX]}]="Exit Safe module"
   [ -n "${ADDR[$ENTRY_IDX]}" ] && LABEL[${ADDR[$ENTRY_IDX]}]="Entry node"
   [ -n "${ADDR[$EXIT_IDX]}" ] && LABEL[${ADDR[$EXIT_IDX]}]="Exit node"
   local n=0
   for i in "${RELAY_IDXS[@]}"; do
     n=$((n + 1))
     [ -n "${SAFE[$i]}" ] && LABEL[${SAFE[$i]}]="Relay $n Safe"
+    [ -n "${MODULE[$i]}" ] && LABEL[${MODULE[$i]}]="Relay $n Safe module"
     [ -n "${ADDR[$i]}" ] && LABEL[${ADDR[$i]}]="Relay $n node"
   done
 
@@ -475,6 +484,8 @@ gather() {
   while read -r ts kind h; do
     [ -n "$h" ] && tx_summary "$h" >/dev/null
   done < <(printf '%s\n' "$TXS" | tail -n 8 | tac)
+  # A few blocks' worth of receipts per frame, for the gas report; see `gas_scan`.
+  gas_scan "$GAS_SCAN_BUDGET" "$GAS_SCAN_SECS"
 }
 
 # Fields of the Entry's and the Exit's private views, from their logs.
@@ -488,9 +499,341 @@ proof_ms() { # circuit excerpt → last total_ms
 }
 secs() { [ -n "${1:-}" ] && trim "$(echo "scale=1; $1 / 1000" | bc)s" || printf '%s' "–"; }
 
+# ── gas ─────────────────────────────────────────────────────────────────────────
+#
+# Every transaction on the chain, from its receipt: `block hash from to gas status selector
+# inner_to inner_selector arg0`. Read block by block through the RPC — `eth_getBlockByNumber` for
+# the calldata, `eth_getBlockReceipts` for the gas — and appended to `${CACHE}_gas`, with the next
+# block to read in `${CACHE}_gas_next`. A block is immutable once mined and this anvil never
+# reorgs, so a block is read once and the file only grows; the dashboard reads a few blocks per
+# frame and keeps up with the chain, `--ledger` reads whatever is left in one go. That is what
+# lets `--ledger` price the run once pix-demo has torn the chain down: the receipts are already
+# here.
+#
+# A node's call to a protocol contract goes through its Safe module (`execTransactionFromModule`)
+# and Safe-owner actions through `execTransaction`; for those the inner target and selector are
+# recorded too, so the report can name what the Safe actually did and where a transfer went.
+GAS_SCAN_BUDGET=40
+GAS_SCAN_SECS=20
+gas_scan() { # blocks-per-call [timeout-secs]
+  local budget=${1:-$GAS_SCAN_BUDGET} secs=${2:-20} next out
+  next=$(cat "${CACHE}_gas_next" 2>/dev/null || echo 0)
+  [ "$budget" -gt 0 ] || return 0
+  # Runs inside the chain container: the head, then every non-empty block in the window as two
+  # JSON lines (block with full transactions, receipts), then the last block read.
+  # The single quotes are deliberate: it is the container's sh that expands these.
+  # shellcheck disable=SC2016
+  local script='
+rpc=http://127.0.0.1:8545
+h=$(cast block-number --rpc-url $rpc) || exit 1
+to=$((FROM + BUDGET - 1)); [ "$to" -gt "$h" ] && to=$h
+echo "head $h"
+n=$FROM
+while [ "$n" -le "$to" ]; do
+  x=$(printf "0x%x" "$n")
+  b=$(cast rpc --rpc-url $rpc eth_getBlockByNumber "$x" true) || exit 1
+  case "$b" in
+  *"\"transactions\":[]"*) ;;
+  *) printf "%s\n" "$b"; cast rpc --rpc-url $rpc eth_getBlockReceipts "$x" || exit 1 ;;
+  esac
+  n=$((n + 1))
+done
+echo "scanned $to"'
+  # Megabytes of block JSON on a long run: kept on disk, not in a variable.
+  out="${CACHE}_gas_scan.tmp"
+  timeout "$secs" docker exec -e FOUNDRY_DISABLE_NIGHTLY_WARNING=1 -e FROM="$next" -e BUDGET="$budget" \
+    "$PIX_CHAIN_CONTAINER" sh -c "$script" >"$out" 2>/dev/null || {
+    rm -f "$out"
+    return 0
+  }
+  local head scanned
+  head=$(sed -n 's/^head //p' "$out")
+  scanned=$(sed -n 's/^scanned //p' "$out")
+  [ -n "$head" ] && printf '%s\n' "$head" >"${CACHE}_gas_head"
+  [ -n "$scanned" ] || {
+    rm -f "$out"
+    return 0
+  }
+  grep -v '^head \|^scanned ' "$out" | jq -rs '
+    def hex: ltrimstr("0x") | explode | map(if . >= 97 then . - 87 elif . >= 65 then . - 55 else . - 48 end) | reduce .[] as $d (0; . * 16 + $d);
+    def word($i): .[$i*64 : $i*64+64];
+    ([.[] | select(type == "array") | .[]] | map({key: (.transactionHash | ascii_downcase), value: .}) | from_entries) as $rc
+    | .[] | select(type == "object") | .transactions[]
+    | . as $t | ($rc[$t.hash | ascii_downcase] // {}) as $r
+    | ($t.input // "0x" | ltrimstr("0x")) as $in | $in[0:8] as $sel
+    # execTransactionFromModule / execTransaction: (address to, uint256 value, bytes data, …) —
+    # the bytes offset sits in word 2, the data one word past it.
+    | (if ($t.to != null) and ($sel == "468721a7" or $sel == "6a761202") then
+         $in[8:] as $a | ($a | word(2) | hex) as $off
+         | {ito: ("0x" + ($a | word(0))[24:64]), isel: $a[$off*2+64 : $off*2+72], arg0: $a[$off*2+72 : $off*2+136]}
+       else {ito: "-", isel: "", arg0: $in[8:72]} end) as $i
+    | [($t.blockNumber | hex), ($t.hash | ascii_downcase), ($t.from | ascii_downcase), ($t.to // "-" | ascii_downcase),
+       ($r.gasUsed // "0x0" | hex), ($r.status // "0x0" | hex),
+       (if $t.to == null then "create" elif $sel == "" then "-" else "0x" + $sel end),
+       $i.ito, (if $i.isel == "" then "-" else "0x" + $i.isel end), (if $i.arg0 == "" then "-" else $i.arg0 end)]
+    | join(" ")' >>"${CACHE}_gas" 2>/dev/null
+  rm -f "$out"
+  printf '%s\n' $((scanned + 1)) >"${CACHE}_gas_next"
+}
+
+# Function selectors → names, for the contracts this chain can see: the HOPR protocol (from
+# hopr-bindings), Curvy v2 (from curvy-abi), Safe. Anything else is shown by its selector.
+gas_selector_names() {
+  cat <<'EOF_SEL'
+0x468721a7 execTransactionFromModule
+0x5229073f execTransactionFromModuleReturnData
+0x6a761202 execTransaction
+0xa9059cbb transfer
+0x23b872dd transferFrom
+0x095ea7b3 approve
+0x9bd9bbc6 send
+0xdcdc7dd0 mint
+0xfe9d9303 burn
+0x62ad1b83 operatorSend
+0x959b8c3f authorizeOperator
+0x2f2ff15d grantRole
+0xd547741f revokeRole
+0x36568abe renounceRole
+0xf2fde38b transferOwnership
+0x715018a6 renounceOwnership
+0x4f1ef286 upgradeToAndCall
+0x439fab91 initialize
+0xc4d66de8 initialize
+0xfc55309a fundChannel
+0x0abec58f fundChannelSafe
+0xeb13eb11 redeemTicket
+0xab9b6ba7 redeemTicketSafe
+0x1a7ffe7a closeIncomingChannel
+0x54a2edf5 closeIncomingChannelSafe
+0x7c8e28da initiateOutgoingChannelClosure
+0xbda65f45 initiateOutgoingChannelClosureSafe
+0x23cb3ac0 finalizeOutgoingChannelClosure
+0x651514bf finalizeOutgoingChannelClosureSafe
+0xea0a5237 announce
+0xfad0e5a2 announceSafe
+0x308c712e revokeSafe
+0x244d496e updateKeyBindingFee
+0x7f935931 registerSafeByNode
+0x49d215e1 registerSafeWithNodeSig
+0x91607c4c deregisterNodeBySafe
+0x9a94addf clone
+0x696ab635 deployModule
+0x477e1487 updateHoprNetwork
+0xfa2aeab4 updateSafeLibAddress
+0x0233296b updateModuleSingletonAddress
+0xabed205b updateErc1820Implementer
+0xb5736962 includeNode
+0x110dcee7 includeNodes
+0x9d95f1cc addNode
+0xdf9620eb addNodes
+0xb2b99ec9 removeNode
+0xa2450f89 addChannelsAndTokenTarget
+0x739c4b08 scopeTargetChannels
+0xa76c9a2f scopeTargetToken
+0xdc06109d scopeTargetSend
+0x3f0444c1 scopeTargetServiceRegistry
+0xfa19501d scopeChannelsCapabilities
+0xc68605c8 scopeTokenCapabilities
+0xc68c3a83 scopeSendCapability
+0x3401cde8 revokeTarget
+0x8b95eccd setMultisend
+0x15981650 setTicketPrice
+0xfde46ff8 setWinProb
+0x0ff55869 registerServiceType
+0x326005af selfRegister
+0x210c3298 selfUpdate
+0x1e46f907 selfDeregister
+0x326d1f22 setRequirement
+0x48559a57 setNodeSafeRegistry
+0xb3f618d1 setTypeRegistrationFee
+0xf13217a9 setSelfRegistrationBurn
+0x1cd0ad00 setSelfUpdateBurn
+0x47ce2eef transferTypeOwnership
+0x634e93da beginDefaultAdminTransfer
+0x649a5ec7 changeDefaultAdminDelay
+0x8d5626c0 submitAggregationRequest
+0x7fda4404 commitPendingNotes
+0x87aabf09 submitWithdrawalRequest
+0xba48d117 autoShield
+0x0f2e251b setAggregationVerifier
+0x65b804ab setPendingNotesCommitmentVerifier
+0x6026b96d setWithdrawalVerifier
+0x1dd706c6 setCommitmentGasFeeRoot
+0xc481dd26 setFeeNotePublicKey
+0xf69b340b setProtocolFees
+0x1b6f139f updateConfig
+0x11c9a94d updateConfig
+0x8340f549 deposit
+0x5f0f48bd withdraw
+0x09824a80 registerToken
+0xbab2af1d deregisterToken
+0x77e5614d setCurvyAggregatorAddress
+0x7d6ba5b3 setFeeCollectorAddress
+0x432c0553 setFeeAmount
+0x3ad4009c setPerTokenGasFees
+0xb17acdcd collectFees
+0xb62c712f bootstrapAccessControl
+0xb64b2a8a deployShieldPortal
+0x848c9f82 deployEntryBridgePortal
+0x2a33cf2e deployExitBridgePortal
+0x53070b55 deployRecoveryEntryPortal
+0x66e93b8c deployRecoveryExitPortal
+0x199c544e shield
+0xe3f5c552 bridge
+0x648bf774 recover
+0x76fceb76 initialize
+0xb63e800d setup
+0x610b5925 enableModule
+0x0d582f13 addOwnerWithThreshold
+0xe318b52b swapOwner
+0x1688f0b9 createProxyWithNonce
+0x8d80ff0a multiSend
+EOF_SEL
+}
+
+# The gas report: every transaction the scan has seen, grouped by who paid for it and what it
+# did, with the average that is the figure to quote; then what one PIX deposit costs the pool,
+# recurring transactions only, one-offs (the shield) beside it. All of it is arithmetic over the
+# receipts — the labels are the only thing the report takes from anywhere else.
+#
+# The chain image deploys the contracts before the cluster exists; those transactions are the
+# image's, not the run's, and are listed apart. The run starts at the first block that touches a
+# node address — the deployer funding it — which is also the first block the labels can name.
+render_gas() {
+  local rows="${CACHE}_gas" head next
+  head=$(cat "${CACHE}_gas_head" 2>/dev/null || echo "")
+  next=$(cat "${CACHE}_gas_next" 2>/dev/null || echo 0)
+  printf '  %sGAS SPENT%s  %severy receipt on the chain, by who paid and what for — avg is the figure to quote%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+  if [ ! -s "$rows" ]; then
+    printf '    %sno receipts — the chain is not reachable and nothing was read while it ran%s\n' "$C_DIM" "$C_RESET"
+    return
+  fi
+  {
+    local a
+    for a in "${!LABEL[@]}"; do printf 'L %s %s\n' "$a" "${LABEL[$a]}"; done
+    gas_selector_names | sed 's/^/S /'
+    sed 's/^/R /' "$rows"
+  } | awk -v head="${head:-?}" -v unread="$next" \
+    -v BOLD="$C_BOLD" -v DIM="$C_DIM" -v GREEN="$C_GREEN" -v RESET="$C_RESET" '
+  function short(a) { return length(a) > 14 ? substr(a, 1, 6) "…" substr(a, length(a) - 3) : a }
+  function lbl(a) { return (a in L) ? L[a] : short(a) }
+  function fn(sel) { return (sel in S) ? S[sel] : sel }
+  function commas(n,   s, r) { s = sprintf("%d", n); r = ""; while (length(s) > 3) { r = "," substr(s, length(s) - 2) r; s = substr(s, 1, length(s) - 3) }; return s r }
+  function dest(w) { return lbl("0x" substr(w, 25, 40)) }
+  # Averages want one row per action: the two relays are one sender, the module of the node is
+  # "its", the stealth deposit addresses are one destination, and so are the four nodes.
+  function collapse(l) { return l ~ /^deposit addr #/ ? "a deposit addr" : l ~ /^Relay [0-9]+ node$/ ? "Relay nodes" : l }
+  function collapse_dest(l) { return l ~ /^deposit addr #/ ? "a deposit addr" : l ~ /^(Entry|Exit|Relay [0-9]+) node$/ ? "a node" : l }
+  function via(l) { return l ~ /^(Entry|Exit|Relay [0-9]+) Safe module$/ ? "its Safe module" : l }
+  function touches_node(a) { return lbl(a) ~ /node$/ }
+  # One table: the senders of `part` by what they spent, each sender by action likewise.
+  function table(part,   m, i, j, t, s, r, a, b, k, p, name) {
+    m = 0; for (s in ssum) { split(s, p, SUBSEP); if (p[1] == part) senders[++m] = s }
+    if (m == 0) { printf "    %snothing%s\n", DIM, RESET; return }
+    for (i = 1; i <= m; i++) for (j = i + 1; j <= m; j++) if (ssum[senders[j]] > ssum[senders[i]]) { t = senders[i]; senders[i] = senders[j]; senders[j] = t }
+    printf "    %s%-62s %5s %9s %9s %9s %11s%s\n", DIM, "", "txs", "avg", "min", "max", "total", RESET
+    for (i = 1; i <= m; i++) {
+      s = senders[i]; split(s, p, SUBSEP)
+      printf "    %s%-62s %5d %9s %9s %9s %11s%s\n", BOLD, p[2], sn[s], "", "", "", commas(ssum[s]), RESET
+      r = 0
+      for (k = 1; k <= keys; k++) { split(order[k], p, SUBSEP); if (p[1] SUBSEP p[2] == s) rk[++r] = order[k] }
+      for (a = 1; a <= r; a++) for (b = a + 1; b <= r; b++) if (sum[rk[b]] > sum[rk[a]]) { t = rk[a]; rk[a] = rk[b]; rk[b] = t }
+      for (a = 1; a <= r; a++) {
+        k = rk[a]; split(k, p, SUBSEP); name = p[3]
+        if (k in failed) name = name " (" failed[k] " failed)"
+        if (length(name) > 60) name = substr(name, 1, 59) "…"
+        printf "      %-60s %5d %9s %9s %9s %11s\n", name, n[k], commas(sum[k] / n[k]), commas(min[k]), commas(max[k]), commas(sum[k])
+      }
+    }
+  }
+  $1 == "L" { L[$2] = substr($0, length($2) + 4); next }
+  $1 == "S" { S[$2] = $3; next }
+  $1 != "R" { next }
+  {
+    rows[++nr] = $0
+    # The run begins where the chain first touches a node: funded by the deployer, or sending.
+    if (touches_node($4) || touches_node($5) || ($11 != "-" && touches_node("0x" substr($11, 25, 40))))
+      if (runstart == "" || $2 + 0 < runstart + 0) runstart = $2 + 0
+  }
+  END {
+    for (i = 1; i <= nr; i++) {
+      $0 = rows[i]
+      blk = $2 + 0; from = $4; to = $5; gas = $6 + 0; ok = $7; sel = $8; ito = $9; isel = $10; arg0 = $11
+      part = (runstart != "" && blk < runstart) ? "setup" : "run"
+      sender = collapse(lbl(from))
+      kind = ""
+      if (to == "-") { act = "contract creation" }
+      else if (sel == "-") { act = "native transfer → " collapse_dest(lbl(to)) }
+      else if (isel != "-") {
+        f = fn(isel); act = lbl(ito) "." f
+        if (f == "transfer" || f == "send" || f == "approve") act = act " → " collapse_dest(dest(arg0))
+        act = act " via " via(lbl(to))
+        if (f == "transfer" && lbl(ito) == "wxHOPR token") kind = "pix"
+      } else {
+        f = fn(sel); act = lbl(to) "." f
+        if (f == "transfer" || f == "send" || f == "mint" || f == "approve") act = act " → " collapse_dest(dest(arg0))
+        if (f == "submitAggregationRequest") { act = "allocation: " act; kind = "allocation" }
+        else if (f == "commitPendingNotes") { act = "commit: " act; kind = "commit" }
+        else if (f == "submitWithdrawalRequest") { act = "withdrawal: " act; kind = "withdrawal" }
+        else if (f == "deployShieldPortal") { act = "shield: " act; kind = "shield" }
+        else if (f == "transfer" && lbl(to) == "wxHOPR token") kind = "pix"
+      }
+      # The PIX side of the ledger: the vault contracts, and wxHOPR moving between the two
+      # Safes, the deposit addresses and the shield portal. Everything else is bootstrap or
+      # protocol.
+      if (kind == "pix") {
+        d = dest(arg0)
+        if (!(sender ~ /^(Entry|Exit) node$/ || sender == "a deposit addr" || d == "Exit Safe" || d ~ /^deposit addr #/ || d ~ /^Entry.s shield portal$/)) kind = ""
+        else if (d ~ /^Entry.s shield portal$/) kind = "shield"
+        else if (sender == "Entry node") kind = "deposit"
+      }
+      key = part SUBSEP sender SUBSEP act
+      if (!(key in n)) { n[key] = 0; sum[key] = 0; min[key] = gas; max[key] = gas; kindof[key] = kind; order[++keys] = key }
+      n[key]++; sum[key] += gas; if (gas < min[key]) min[key] = gas; if (gas > max[key]) max[key] = gas
+      if (ok != "1") failed[key]++
+      sn[part SUBSEP sender]++; ssum[part SUBSEP sender] += gas
+      total[part] += gas; txs[part]++
+      if (first[part] == "" || blk < first[part]) first[part] = blk
+      if (blk > last[part]) last[part] = blk
+      if (kind == "allocation") allocations++
+      if (kind == "deposit") deposits++
+    }
+    printf "    %s%d transactions in blocks %d–%d, %s gas in all", DIM, txs["run"] + txs["setup"], first["setup"] == "" ? first["run"] : first["setup"], last["run"] == "" ? last["setup"] : last["run"], commas(total["run"] + total["setup"])
+    if (head != "?" && unread + 0 <= head + 0) printf " · blocks %d–%s not read yet", unread, head
+    printf "%s\n", RESET
+    printf "\n    %sTHE RUN%s  %sfrom block %s: %d transactions, %s gas%s\n", BOLD, RESET, DIM, first["run"] == "" ? "?" : first["run"], txs["run"], commas(total["run"]), RESET
+    table("run")
+    # What one deposit costs. With Curvy a deposit is one allocation and the commit that lands
+    # it, plus its share of the withdrawals; with the plain pool the two transfers.
+    cycles = allocations > 0 ? allocations : deposits
+    printf "\n  %sPER PIX DEPOSIT%s  %swhat the pool spends per deposit, recurring transactions only%s\n", BOLD, RESET, DIM, RESET
+    if (cycles == 0) printf "    %sno deposit yet%s\n", DIM, RESET
+    else {
+      per = 0
+      split("deposit allocation commit withdrawal pix", cycle, " ")
+      for (c = 1; c <= 5; c++) for (k = 1; k <= keys; k++) {
+        key = order[k]
+        if (kindof[key] != cycle[c]) continue
+        split(key, p, SUBSEP)
+        share = sum[key] / cycles; per += share
+        printf "    %-58s %10s   %s%d tx / %d deposits × avg %s%s\n", substr(p[3], 1, 58), commas(share), DIM, n[key], cycles, commas(sum[key] / n[key]), RESET
+      }
+      printf "    %s≈ %s gas per deposit%s over %d deposit(s)", GREEN BOLD, commas(per), RESET, cycles
+      one = 0
+      for (k = 1; k <= keys; k++) if (kindof[order[k]] == "shield") one += sum[order[k]]
+      if (one > 0) printf " · %sone-off shield %s gas, not counted%s", DIM, commas(one), RESET
+      printf "\n"
+    }
+    if (txs["setup"] > 0) {
+      printf "\n    %sCHAIN SETUP%s  %sby the image, before the cluster: blocks %d–%d, %d transactions, %s gas%s\n", BOLD, RESET, DIM, first["setup"], last["setup"], txs["setup"], commas(total["setup"]), RESET
+      table("setup")
+    }
+  }'
+}
+
 # ── dashboard ───────────────────────────────────────────────────────────────────
 
-declare -a EXCERPT SAFE ADDR
+declare -a EXCERPT SAFE ADDR MODULE
 declare -A INDEXED EXIT_NOTES BOOTSTRAP
 
 render() {
@@ -722,11 +1065,16 @@ case "${1:-}" in
   exit 0
   ;;
 --ledger)
+  # The chain, while it is still there, is read to the head before pricing the run.
+  GAS_SCAN_BUDGET=1000000
+  GAS_SCAN_SECS=300
   gather
   printf '\n%swxHOPR Transfer events on chain %s, %d in all, labelled:%s\n\n' "$C_BOLD" "${CHAIN_ID:-?}" "$(printf '%s\n' "$ROWS" | grep -c .)" "$C_RESET"
   print_rows "$ROWS"
   printf '\n'
   render_verdict
+  printf '\n'
+  render_gas
   printf '\n'
   exit 0
   ;;
