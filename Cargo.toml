@@ -71,18 +71,24 @@ hopr-session-server-forwarder = { version = "0.3.0", default-features = false }
 # only job is to document a version; this is a real dependency the resolver acts on, and pinning
 # it exactly would conflict with any other crate in the graph asking for a later 4.x.
 #
-# 4.0.0 is `477ab741` on that repo's `main` — the squash-merge of hopr-strategy#51 — per the
-# release's `.cargo_vcs_info.json`. Verified rather than assumed: the published `src/` tree diffs
-# clean against that commit, the only omissions being the `insta` snapshot directories, which the
-# package excludes and no consumer compiles.
+# 5.0.0 is the first release whose Curvy deposit pool (`strategy-pix-curvy`) builds from
+# crates.io alone: the Curvy SDK crates (`curvy-sdk`, `curvy-chain-blokli` and the ones beneath
+# them, 0.1.0-rc.6) are published, `curvy-core` 0.1.0-rc.6 asks for `thiserror` as a caret range
+# that agrees with `hopr-api`'s, and the `vendor/` copies and the `[patch.crates-io]` lines every
+# consumer had to repeat are gone with it. Until hoprnet publishes 5.0.0 the crate is taken from
+# the `[patch.crates-io]` at the bottom of this manifest, pinned to a rev; the patch has to
+# satisfy this requirement, which is why it reads 5.0.0 ahead of the registry.
 #
-# 4.0.0 is the third major in a fortnight, and it had to be taken together with the `hopr-lib` rev
-# above: 2.0.0 moved to `hopr-api` 3.0 and 3.0.0 to `hopr-api` 4.1, which is the agreement the
-# `hopr-api` line above records. Sitting still was not an option once hoprnet moved — the
-# `PixEvent` the node emits and the one the pool consumes are the same type only when both sides
-# agree on the major.
+# The pool's proving artifacts are not in any crate. The SDK reads each circuit's zkey and
+# witness graph from `CURVY_ZK_KEYS_DIR` at run time, digest-checked, and the ten files ship
+# with each rs-sdk release; the `hoprd-pix-curvy` image in `flake.nix` carries them and sets the
+# variable, anything else has to provide both.
 #
-# What those majors changed for this workspace:
+# Still on `hopr-api` 4.1, so the `=4.1.0` line above and the `hopr-lib` rev stay. What the
+# earlier majors changed for this workspace is recorded below because the code still reflects it.
+#
+# What 4.0.0 changed (2.0.0 moved to `hopr-api` 3.0 and 3.0.0 to `hopr-api` 4.1; `hopr-api`
+# majors cannot coexist across this boundary, see the `hopr-api` line above):
 #   - `strategy-pix-secp256k1` became `strategy-pix-test`, and `pix::secp256k1` became
 #     `pix::pools::plain` — renamed upstream so that a pool offering no anonymity is named for how
 #     it settles rather than for the curve it settles on, and cannot be reached for in production
@@ -103,7 +109,7 @@ hopr-session-server-forwarder = { version = "0.3.0", default-features = false }
 #     All carry serde defaults, so existing `Pix` stanzas still parse unchanged.
 #   - Both builders now call `StrategyError::validate_config` before constructing anything, so a
 #     bad stanza fails at `build_strategies` instead of at the first deposit.
-hopr-strategy = { version = "4.0.0", default-features = false }
+hopr-strategy = { version = "5.0.0", default-features = false }
 # Feature set stated explicitly, carried over from `main`. The default set is `cli` + `redb`;
 # `serde` is not in it, and `main` turns it on, so leaving this bare would silently drop a
 # feature the rest of the workspace expects.
@@ -267,14 +273,10 @@ codegen-units = 16
 [workspace.metadata.cargo-shear]
 ignored = ["hopr-api"]
 
-# `hopr-strategy` with the Curvy deposit pool is not on crates.io: the pool pulls the Curvy SDK in
-# as a git dependency, which crates.io refuses, and two of the SDK's crates (`curvy-prover`,
-# `curvy-witness`) are vendored inside hopr-strategy with a `thiserror` pin relaxed — the published
-# ones pin `=2.0.19` against `hopr-api`'s `^2.0.20`. Cargo only honours `[patch]` from the root
-# workspace, so those two patches have to be repeated here; see `vendor/README.md` in
-# hopr-strategy. Path sources while the branch is under test; switch all three to
-# `git = "https://github.com/hoprnet/hopr-strategy", rev = "<rev>"` once it is pushed.
+# `hopr-strategy` 5.0.0 is not on crates.io yet: it is the Curvy PIX branch, under review as a
+# PR against hoprnet/hopr-strategy. Pinned to a rev on the fork it is reviewed from, so a rebuild
+# is reproducible and moving it is a reviewable change; the rev is the commit that switched the
+# Curvy crates to their crates.io releases and deleted `vendor/`. Drop this whole section once
+# hoprnet releases 5.0.0.
 [patch.crates-io]
-curvy-prover  = { path = "../hopr-strategy/vendor/curvy-prover" }
-curvy-witness = { path = "../hopr-strategy/vendor/curvy-witness" }
-hopr-strategy = { path = "../hopr-strategy" }
+hopr-strategy = { git = "https://github.com/0xCurvy/hopr-strategy", rev = "c16ecebb0062af3293a1b535f6307d3633bb90bf" }
